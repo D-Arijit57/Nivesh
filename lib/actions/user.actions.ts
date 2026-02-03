@@ -3,12 +3,12 @@
 import { ID, Query } from "node-appwrite";
 import { createAdminClient, createSessionClient } from "../appwrite";
 import { cookies } from "next/headers";
-import { encryptId, extractCustomerIdFromUrl, parseStringify } from "../utils";
-import { CountryCode, ProcessorTokenCreateRequest, ProcessorTokenCreateRequestProcessorEnum, Products } from "plaid";
-
-import { plaidClient } from '@/lib/plaid';
+import { encryptId, parseStringify } from "../utils";
 import { revalidatePath } from "next/cache";
-import { addFundingSource, createDwollaCustomer } from "./dwolla.actions";
+
+// Indian KYC imports
+import { encrypt, hashAadhaar, maskAadhaar } from "../encryption";
+import { indianSignUpSchema } from "../validators/indian";
 
 const {
   APPWRITE_DATABASE_ID: DATABASE_ID,
@@ -52,7 +52,13 @@ export const signIn = async ({ email, password }: signInProps) => {
   }
 }
 
+/**
+ * Sign up - Redirects to Indian sign-up flow
+ * @deprecated Use signUpIndia instead for Indian banking
+ */
 export const signUp = async ({ password, ...userData }: SignUpParams) => {
+  // For Indian banking, we use the Indian sign-up flow
+  // This maintains backward compatibility while transitioning
   const { email, firstName, lastName } = userData;
   
   let newUserAccount;
@@ -69,15 +75,7 @@ export const signUp = async ({ password, ...userData }: SignUpParams) => {
 
     if(!newUserAccount) throw new Error('Error creating user')
 
-    const dwollaCustomerUrl = await createDwollaCustomer({
-      ...userData,
-      type: 'personal'
-    })
-
-    if(!dwollaCustomerUrl) throw new Error('Error creating Dwolla customer')
-
-    const dwollaCustomerId = extractCustomerIdFromUrl(dwollaCustomerUrl);
-
+    // Create user document without Dwolla (Indian flow)
     const newUser = await database.createDocument(
       DATABASE_ID!,
       USER_COLLECTION_ID!,
@@ -85,8 +83,9 @@ export const signUp = async ({ password, ...userData }: SignUpParams) => {
       {
         ...userData,
         userId: newUserAccount.$id,
-        dwollaCustomerId,
-        dwollaCustomerUrl
+        // Indian banking fields (Phase 2-3 will add Setu/Razorpay)
+        kycVerified: false,
+        kycStatus: 'pending',
       }
     )
 
@@ -131,26 +130,6 @@ export const logoutAccount = async () => {
   }
 }
 
-export const createLinkToken = async (user: User) => {
-  try {
-    const tokenParams = {
-      user: {
-        client_user_id: user.$id
-      },
-      client_name: `${user.firstName} ${user.lastName}`,
-      products: ['auth'] as Products[],
-      language: 'en',
-      country_codes: ['US'] as CountryCode[],
-    }
-
-    const response = await plaidClient.linkTokenCreate(tokenParams);
-
-    return parseStringify({ linkToken: response.data.link_token })
-  } catch (error) {
-    console.log(error);
-  }
-}
-
 export const createBankAccount = async ({
   userId,
   bankId,
@@ -182,66 +161,25 @@ export const createBankAccount = async ({
   }
 }
 
+/**
+ * @deprecated Plaid/Dwolla removed - Use Indian banking (Setu) for account linking
+ * This function is kept for backward compatibility but will throw an error
+ */
+export const createLinkToken = async (user: User) => {
+  console.warn('createLinkToken is deprecated. Use Setu Account Aggregator for Indian banking.');
+  throw new Error('Plaid integration removed. Use Setu Account Aggregator for linking bank accounts.');
+}
+
+/**
+ * @deprecated Plaid/Dwolla removed - Use Indian banking (Setu) for account linking
+ * This function is kept for backward compatibility but will throw an error
+ */
 export const exchangePublicToken = async ({
   publicToken,
   user,
 }: exchangePublicTokenProps) => {
-  try {
-    // Exchange public token for access token and item ID
-    const response = await plaidClient.itemPublicTokenExchange({
-      public_token: publicToken,
-    });
-
-    const accessToken = response.data.access_token;
-    const itemId = response.data.item_id;
-    
-    // Get account information from Plaid using the access token
-    const accountsResponse = await plaidClient.accountsGet({
-      access_token: accessToken,
-    });
-
-    const accountData = accountsResponse.data.accounts[0];
-
-    // Create a processor token for Dwolla using the access token and account ID
-    const request: ProcessorTokenCreateRequest = {
-      access_token: accessToken,
-      account_id: accountData.account_id,
-      processor: "dwolla" as ProcessorTokenCreateRequestProcessorEnum,
-    };
-
-    const processorTokenResponse = await plaidClient.processorTokenCreate(request);
-    const processorToken = processorTokenResponse.data.processor_token;
-
-     // Create a funding source URL for the account using the Dwolla customer ID, processor token, and bank name
-     const fundingSourceUrl = await addFundingSource({
-      dwollaCustomerId: user.dwollaCustomerId,
-      processorToken,
-      bankName: accountData.name,
-    });
-    
-    // If the funding source URL is not created, throw an error
-    if (!fundingSourceUrl) throw Error;
-
-    // Create a bank account using the user ID, item ID, account ID, access token, funding source URL, and shareableId ID
-    await createBankAccount({
-      userId: user.$id,
-      bankId: itemId,
-      accountId: accountData.account_id,
-      accessToken,
-      fundingSourceUrl,
-      shareableId: encryptId(accountData.account_id),
-    });
-
-    // Revalidate the path to reflect the changes
-    revalidatePath("/");
-
-    // Return a success message
-    return parseStringify({
-      publicTokenExchange: "complete",
-    });
-  } catch (error) {
-    console.error("An error occurred while creating exchanging token:", error);
-  }
+  console.warn('exchangePublicToken is deprecated. Use Setu Account Aggregator for Indian banking.');
+  throw new Error('Plaid integration removed. Use Setu Account Aggregator for linking bank accounts.');
 }
 
 export const getBanks = async ({ userId }: getBanksProps) => {
@@ -293,3 +231,301 @@ export const getBankByAccountId = async ({ accountId }: getBankByAccountIdProps)
     console.log(error)
   }
 }
+
+// ===========================================
+// Indian Banking Functions
+// ===========================================
+
+/**
+ * Sign up a new user with Indian KYC (PAN/Aadhaar/UPI)
+ * 
+ * This function:
+ * 1. Validates Indian KYC data (PAN, Aadhaar, or UPI required)
+ * 2. Encrypts sensitive data (PAN, creates Aadhaar hash)
+ * 3. Creates Appwrite account and user document
+ * 4. Does NOT create Dwolla/Plaid connections (Phase 2 will add Setu/Razorpay)
+ * 
+ * @param userData - Indian sign-up parameters with KYC
+ * @returns Created user or error
+ */
+export const signUpIndia = async ({ password, ...userData }: SignUpParamsIndia) => {
+  const { email, firstName, lastName, pan, aadhaar, upiId } = userData;
+  
+  let newUserAccount;
+
+  try {
+    // Validate Indian KYC data
+    const validation = indianSignUpSchema.safeParse({ ...userData, password });
+    if (!validation.success) {
+      console.error('Validation error:', validation.error.format());
+      throw new Error(`Validation failed: ${validation.error.issues.map(i => i.message).join(', ')}`);
+    }
+
+    const { account, database } = await createAdminClient();
+
+    // Create Appwrite account
+    newUserAccount = await account.create(
+      ID.unique(), 
+      email, 
+      password, 
+      `${firstName} ${lastName}`
+    );
+
+    if (!newUserAccount) throw new Error('Error creating user account');
+
+    // Prepare KYC data for storage
+    const kycData: Record<string, string | boolean | null> = {
+      kycVerified: false,
+      kycStatus: 'pending' as KYCStatus,
+      kycVerifiedAt: null,
+      kycRejectedReason: null,
+    };
+
+    // Encrypt PAN if provided
+    if (pan) {
+      const encryptedPan = encrypt(pan);
+      kycData.pan = encryptedPan;
+      // Masked format: ABCDE****F (5 chars + 4 asterisks + 1 char = 10 chars)
+      kycData.panMasked = `${pan.slice(0, 5)}****${pan.slice(-1)}`;
+    }
+
+    // Hash Aadhaar if provided (never store raw Aadhaar)
+    if (aadhaar) {
+      // Remove spaces from formatted Aadhaar
+      const rawAadhaar = aadhaar.replace(/\s/g, '');
+      kycData.aadhaarHash = hashAadhaar(rawAadhaar);
+      kycData.aadhaarLast4 = maskAadhaar(rawAadhaar); // Returns XXXX-XXXX-1234
+    }
+
+    // Store UPI ID if provided
+    if (upiId) {
+      kycData.upiId = upiId.toLowerCase();
+    }
+
+    // Clean phone number for storage (+91XXXXXXXXXX format)
+    const cleanPhone = userData.phone.replace(/\s/g, '');
+
+    // Create user document in Appwrite
+    const newUser = await database.createDocument(
+      DATABASE_ID!,
+      USER_COLLECTION_ID!,
+      ID.unique(),
+      {
+        userId: newUserAccount.$id,
+        email,
+        firstName,
+        lastName,
+        name: `${firstName} ${lastName}`,
+        address1: userData.address1,
+        city: userData.city,
+        state: userData.state,
+        postalCode: userData.postalCode,
+        dateOfBirth: userData.dateOfBirth,
+        phone: cleanPhone,
+        // Indian KYC fields
+        ...kycData,
+        // Placeholder for Indian payment providers (Phase 2-3)
+        setuConsentId: null,
+        razorpayCustomerId: null,
+        razorpayFundAccountId: null,
+      }
+    );
+
+    // Create session
+    const session = await account.createEmailPasswordSession(email, password);
+
+    cookies().set("appwrite-session", session.secret, {
+      path: "/",
+      httpOnly: true,
+      sameSite: "strict",
+      secure: process.env.NODE_ENV === "production",
+    });
+
+    return parseStringify(newUser);
+  } catch (error) {
+    console.error('Error in signUpIndia:', error);
+    
+    // Clean up: delete account if user document creation failed
+    if (newUserAccount) {
+      try {
+        const { account } = await createAdminClient();
+        // Note: Admin SDK doesn't have deleteUser, would need to handle this differently
+        console.error('User account created but document failed. Manual cleanup needed for:', newUserAccount.$id);
+      } catch (cleanupError) {
+        console.error('Cleanup error:', cleanupError);
+      }
+    }
+    
+    throw error;
+  }
+};
+
+/**
+ * Update user KYC information
+ * 
+ * @param userId - User ID to update
+ * @param kycData - KYC fields to update
+ * @returns Updated user
+ */
+export const updateUserKYC = async (
+  userId: string,
+  kycData: {
+    pan?: string;
+    aadhaar?: string;
+    upiId?: string;
+  }
+) => {
+  try {
+    const { database } = await createAdminClient();
+
+    // Find user document
+    const users = await database.listDocuments(
+      DATABASE_ID!,
+      USER_COLLECTION_ID!,
+      [Query.equal('userId', [userId])]
+    );
+
+    if (users.total === 0) {
+      throw new Error('User not found');
+    }
+
+    const userDoc = users.documents[0];
+    const updateData: Record<string, string | boolean> = {};
+
+    // Encrypt PAN if provided
+    if (kycData.pan) {
+      const encryptedPan = encrypt(kycData.pan);
+      updateData.pan = encryptedPan;
+      updateData.panMasked = `${kycData.pan.slice(0, 5)}****${kycData.pan.slice(-1)}`;
+    }
+
+    // Hash Aadhaar if provided
+    if (kycData.aadhaar) {
+      const rawAadhaar = kycData.aadhaar.replace(/\s/g, '');
+      updateData.aadhaarHash = hashAadhaar(rawAadhaar);
+      updateData.aadhaarLast4 = maskAadhaar(rawAadhaar);
+    }
+
+    // Store UPI ID if provided
+    if (kycData.upiId) {
+      updateData.upiId = kycData.upiId.toLowerCase();
+    }
+
+    // Update user document
+    const updatedUser = await database.updateDocument(
+      DATABASE_ID!,
+      USER_COLLECTION_ID!,
+      userDoc.$id,
+      updateData
+    );
+
+    return parseStringify(updatedUser);
+  } catch (error) {
+    console.error('Error updating KYC:', error);
+    throw error;
+  }
+};
+
+/**
+ * Update user KYC status
+ * Called after verification via Setu AA or manual verification
+ * 
+ * @param userId - User ID to update
+ * @param status - New KYC status
+ * @param reason - Optional rejection reason (required if status is 'rejected')
+ * @returns Updated user
+ */
+export const updateUserKYCStatus = async (
+  userId: string,
+  status: KYCStatus,
+  reason?: string
+) => {
+  try {
+    const { database } = await createAdminClient();
+
+    // Find user document
+    const users = await database.listDocuments(
+      DATABASE_ID!,
+      USER_COLLECTION_ID!,
+      [Query.equal('userId', [userId])]
+    );
+
+    if (users.total === 0) {
+      throw new Error('User not found');
+    }
+
+    const userDoc = users.documents[0];
+
+    // Build update data
+    const updateData: Record<string, string | boolean | null> = {
+      kycStatus: status,
+      kycVerified: status === 'verified', // Keep backwards compatibility
+    };
+
+    if (status === 'verified') {
+      updateData.kycVerifiedAt = new Date().toISOString();
+      updateData.kycRejectedReason = null;
+    } else if (status === 'rejected') {
+      updateData.kycRejectedReason = reason || 'Verification failed';
+      updateData.kycVerifiedAt = null;
+    } else if (status === 'expired') {
+      updateData.kycVerifiedAt = null;
+    }
+
+    // Update KYC status
+    const updatedUser = await database.updateDocument(
+      DATABASE_ID!,
+      USER_COLLECTION_ID!,
+      userDoc.$id,
+      updateData
+    );
+
+    return parseStringify(updatedUser);
+  } catch (error) {
+    console.error('Error updating KYC status:', error);
+    throw error;
+  }
+};
+
+/**
+ * Mark user KYC as verified (convenience function)
+ * @deprecated Use updateUserKYCStatus instead
+ * Called after successful verification via Setu AA or manual verification
+ * 
+ * @param userId - User ID to verify
+ * @returns Updated user
+ */
+export const verifyUserKYC = async (userId: string) => {
+  return updateUserKYCStatus(userId, 'verified');
+};
+
+/**
+ * Get user by phone number
+ * Used for OTP login flow
+ * 
+ * @param phone - Phone number in +91XXXXXXXXXX format
+ * @returns User or null
+ */
+export const getUserByPhone = async (phone: string): Promise<UserIndia | null> => {
+  try {
+    const { database } = await createAdminClient();
+
+    // Clean phone number
+    const cleanPhone = phone.replace(/\s/g, '');
+
+    const users = await database.listDocuments(
+      DATABASE_ID!,
+      USER_COLLECTION_ID!,
+      [Query.equal('phone', [cleanPhone])]
+    );
+
+    if (users.total === 0) {
+      return null;
+    }
+
+    return parseStringify(users.documents[0]);
+  } catch (error) {
+    console.error('Error getting user by phone:', error);
+    return null;
+  }
+};

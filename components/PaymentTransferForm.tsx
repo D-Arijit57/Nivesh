@@ -7,7 +7,7 @@ import { useState } from "react";
 import { useForm } from "react-hook-form";
 import * as z from "zod";
 
-import { createTransfer } from "@/lib/actions/dwolla.actions";
+import { initiatePayoutIndia } from "@/lib/actions/razorpay.actions";
 import { createTransaction } from "@/lib/actions/transaction.actions";
 import { getBank, getBankByAccountId } from "@/lib/actions/user.actions";
 import { decryptId } from "@/lib/utils";
@@ -59,32 +59,36 @@ const PaymentTransferForm = ({ accounts }: PaymentTransferFormProps) => {
       });
       const senderBank = await getBank({ documentId: data.senderBank });
 
-      const transferParams = {
-        sourceFundingSourceUrl: senderBank.fundingSourceUrl,
-        destinationFundingSourceUrl: receiverBank.fundingSourceUrl,
+      // Indian Banking: Use Razorpay payout instead of Dwolla transfer
+      // Note: For P2P transfers, we need receiver's fund account
+      // For now, we'll use the transaction-based approach
+      
+      const transaction = {
+        name: data.name,
         amount: data.amount,
+        senderId: senderBank.userId.$id,
+        senderBankId: senderBank.$id,
+        receiverId: receiverBank.userId.$id,
+        receiverBankId: receiverBank.$id,
+        email: data.email,
       };
-      // create transfer
-      const transfer = await createTransfer(transferParams);
 
-      // create transfer transaction
-      if (transfer) {
-        const transaction = {
-          name: data.name,
-          amount: data.amount,
-          senderId: senderBank.userId.$id,
-          senderBankId: senderBank.$id,
-          receiverId: receiverBank.userId.$id,
-          receiverBankId: receiverBank.$id,
-          email: data.email,
-        };
+      const newTransaction = await createTransaction(transaction);
 
-        const newTransaction = await createTransaction(transaction);
-
-        if (newTransaction) {
-          form.reset();
-          router.push("/");
-        }
+      if (newTransaction) {
+        // For Indian banking with Razorpay payout (requires fundAccountRecordId)
+        // This can be enhanced later when fund accounts are set up
+        // const payout = await initiatePayoutIndia({
+        //   userId: senderBank.userId.$id,
+        //   fundAccountRecordId: receiverBank.razorpayFundAccountId,
+        //   amount: parseFloat(data.amount),
+        //   mode: 'IMPS',
+        //   purpose: 'payout',
+        //   narration: data.name,
+        // });
+        
+        form.reset();
+        router.push("/");
       }
     } catch (error) {
       console.error("Submitting create transfer request failed: ", error);

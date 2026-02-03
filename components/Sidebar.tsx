@@ -6,7 +6,6 @@ import Image from 'next/image'
 import Link from 'next/link'
 import { usePathname } from 'next/navigation'
 import Footer from './Footer'
-import PlaidLink from './PlaidLink'
 
 const Sidebar = ({ user }: SiderbarProps) => {
   const pathname = usePathname();
@@ -49,7 +48,7 @@ const Sidebar = ({ user }: SiderbarProps) => {
           )
         })}
         
-        <PlaidLink user={user} />
+        {/* Indian Banking: Link bank accounts via Setu AA from My Banks page */}
       </nav>
 
       <Footer user={user} />
